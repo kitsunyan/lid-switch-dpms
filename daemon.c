@@ -109,11 +109,20 @@ static void drm_release(drm * drm) {
 	}
 }
 
-static int xorg_x11_error_handler(Display * display, XErrorEvent * event) {}
+static int xorg_x11_error_handler(Display * display, XErrorEvent * event) {
+	return 0;
+}
 
-static void xorg_x11_set_dpms(const char * dstr, const char * xauth, int on) {
+static int xorg_x11_set_dpms(const char * dstr, const char * xauth, int on) {
+	int fd[2];
+	pipe(fd);
 	int pid = fork();
 	if (pid == 0) {
+		close(2);
+		dup(fd[1]);
+		close(fd[0]);
+		close(fd[1]);
+		setenv("LANG", "C", 1);
 		setenv("DISPLAY", dstr, 1);
 		if (xauth) {
 			setenv("XAUTHORITY", xauth, 1);
@@ -129,9 +138,92 @@ static void xorg_x11_set_dpms(const char * dstr, const char * xauth, int on) {
 			exit(0);
 		}
 		exit(1);
+		return 0;
 	} else if (pid > 0) {
+		close(fd[1]);
+		char buf[XBUF_SIZE];
+		int pos = 0;
+		int count;
+		while ((count = read(fd[0], &buf[pos], 1)) == 1) {
+			pos = pos >= XBUF_SIZE - 1 ? XBUF_SIZE - 1 : pos + 1;
+		}
+		buf[pos] = '\0';
 		wait(0);
+		close(fd[0]);
+		return strstr(buf, "No protocol specified") == NULL;
+	} else {
+		close(fd[0]);
+		close(fd[1]);
+		return 0;
 	}
+}
+
+static int xorg_check_xauth(int pid, const char * dstr, char * auth, int sz) {
+	char buf[XBUF_SIZE];
+	sprintf(buf, "/proc/%d/environ", pid);
+	int fd = open(buf, O_RDONLY);
+	int display_matches = 0;
+	int xauth_found = 0;
+	if (fd >= 0) {
+		int pos = 0;
+		while (1) {
+			int count = read(fd, &buf[pos], 1);
+			if (count != 1) {
+				buf[pos] = '\0';
+			}
+			if (buf[pos] == '\0') {
+				if (pos > 0) {
+					if (strstr(buf, "DISPLAY=") == buf) {
+						const char * display = &buf[8];
+						if (!strcmp(display, dstr)) {
+							display_matches = 1;
+							if (xauth_found) {
+								break;
+							}
+						}
+					} else if (strstr(buf, "XAUTHORITY=") == buf) {
+						const char * xauthority = &buf[11];
+						int flen = pos - 11;
+						if (flen <= sz) {
+							memcpy(auth, xauthority, flen);
+							xauth_found = 1;
+							if (display_matches) {
+								break;
+							}
+						}
+					}
+					pos = 0;
+				}
+				if (count != 1) {
+					break;
+				}
+			} else {
+				pos = pos >= XBUF_SIZE - 1 ? XBUF_SIZE - 1 : pos + 1;
+			}
+		}
+		close(fd);
+	}
+	return display_matches && xauth_found;
+}
+
+static int xorg_find_xauth(const char * dstr, char * auth, int sz) {
+	char buf[80];
+	DIR * dir = opendir("/proc/");
+	int res = 0;
+	if (dir) {
+		struct dirent * entry;
+		while (entry = readdir(dir)) {
+			if (entry->d_type == DT_DIR && entry->d_name) {
+				int pid = atoi(entry->d_name);
+				if (pid > 0 && xorg_check_xauth(pid, dstr, auth, sz)) {
+					res = 1;
+					break;
+				}
+			}
+		}
+		closedir(dir);
+	}
+	return res;
 }
 
 static int xorg_pid_set_dpms(int pid, int on) {
@@ -166,13 +258,16 @@ static int xorg_pid_set_dpms(int pid, int on) {
 					break;
 				}
 			} else {
-				pos = pos >= XBUF_SIZE - 1 ? XBUF_SIZE : pos + 1;
+				pos = pos >= XBUF_SIZE - 1 ? XBUF_SIZE - 1 : pos + 1;
 			}
 		}
 		close(fd);
 		if (display[0]) {
-			xorg_x11_set_dpms(display, xauth[0] ? xauth : NULL, on);
-			return 1;
+			int res = xorg_x11_set_dpms(display, xauth[0] ? xauth : NULL, on);
+			if (!res && xorg_find_xauth(display, xauth, XBUF_SIZE)) {
+				res = xorg_x11_set_dpms(display, xauth, on);
+			}
+			return res;
 		}
 	}
 	return 0;
