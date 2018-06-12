@@ -1,0 +1,10 @@
+[Unit]
+Description=Lid Switch DPMS Service
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=@PKGLIBDIR@/daemon
+
+[Install]
+WantedBy=multi-user.target
